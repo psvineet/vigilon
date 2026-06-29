@@ -489,33 +489,49 @@ def get_logs(filter_text=""):
 
 @cached("wifi_info", ttl=5)
 def get_wifi_info():
-    iw_out = run_cmd("iwconfig 2>/dev/null") or run_cmd("nmcli -t -f active,ssid,signal,freq,chan,security,rate dev wifi 2>/dev/null")
-    if not iw_out:
-        return {"available": False, "message": "No wireless interface detected."}
-    # Use pipe separator to avoid breaking on SSIDs with colons
+    import re as _re2
+    # Try nmcli first (most reliable, handles connected state)
     nmcli_out = run_cmd("nmcli --terse --fields active,ssid,signal,freq,chan,security,rate dev wifi 2>/dev/null")
     if nmcli_out:
         for line in nmcli_out.splitlines():
-            # nmcli --terse uses colon but escapes embedded colons as \:
-            # Split on unescaped colons only
-            import re as _re2
             parts = _re2.split(r'(?<!\\):', line)
             parts = [p.replace('\\:', ':') for p in parts]
-            if len(parts) >= 7 and parts[0].lower() in ('yes', 'true', '*'):
+            if len(parts) >= 2 and parts[0].lower() in ('yes', '*'):
                 return {
                     "available": True,
-                    "ssid": parts[1] or "(hidden)",
-                    "signal": parts[2] + "%",
-                    "frequency": parts[3],
-                    "channel": parts[4],
-                    "security": parts[5] or "Open",
-                    "bitrate": parts[6],
+                    "ssid": parts[1] if len(parts) > 1 else "(hidden)",
+                    "signal": (parts[2] + "%") if len(parts) > 2 else "N/A",
+                    "frequency": parts[3] if len(parts) > 3 else "N/A",
+                    "channel": parts[4] if len(parts) > 4 else "N/A",
+                    "security": (parts[5] or "Open") if len(parts) > 5 else "N/A",
+                    "bitrate": parts[6] if len(parts) > 6 else "N/A",
                 }
-    # fallback: try iw
-    iw_ssid = run_cmd("iw dev 2>/dev/null | awk '/Interface/{iface=$2} /ssid/{print iface\":\"+$2}'") or ""
-    if iw_ssid:
-        return {"available": True, "message": "Connected", "raw": iw_out[:800]}
-    return {"available": True, "message": "Wireless interface present; nmcli/iw details unavailable.", "raw": iw_out[:500]}
+        # nmcli present but no active connection - list available networks
+        networks = []
+        for line in nmcli_out.splitlines():
+            parts = _re2.split(r'(?<!\\):', line)
+            parts = [p.replace('\\:', ':') for p in parts]
+            if len(parts) >= 2 and parts[1].strip():
+                networks.append(parts[1].strip())
+        return {"available": True, "connected": False,
+                "message": "Wireless interface found but not connected.",
+                "networks": networks[:10]}
+    # Fallback: iwconfig / iw
+    iw_out = run_cmd("iwconfig 2>/dev/null")
+    if iw_out and ("ESSID" in iw_out or "IEEE" in iw_out):
+        ssid_match = _re2.search(r'ESSID:"([^"]+)"', iw_out)
+        signal_match = _re2.search(r'Signal level=(-?\d+)', iw_out)
+        return {
+            "available": True,
+            "ssid": ssid_match.group(1) if ssid_match else "Unknown",
+            "signal": (signal_match.group(1) + " dBm") if signal_match else "N/A",
+            "frequency": "N/A", "channel": "N/A", "security": "N/A", "bitrate": "N/A",
+        }
+    # Check if wifi interface exists at all
+    iw_dev = run_cmd("iw dev 2>/dev/null") or run_cmd("ls /sys/class/net/ 2>/dev/null | grep -E 'wl|wlan|wifi'")
+    if iw_dev:
+        return {"available": True, "connected": False, "message": "Wireless interface found but no connection data available."}
+    return {"available": False, "message": "No wireless interface detected."}
 
 
 @cached("hardware_info", ttl=10)
@@ -634,23 +650,56 @@ def get_bluetooth_devices():
 
 @cached("gpu_info", ttl=5)
 def get_gpu_info():
-    nvidia = run_cmd("nvidia-smi --query-gpu=name,temperature.gpu,memory.used,memory.total,utilization.gpu "
-                      "--format=csv,noheader 2>/dev/null")
+    gpus = []
+    # ── NVIDIA via nvidia-smi ──
+    nvidia = run_cmd("nvidia-smi --query-gpu=name,temperature.gpu,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits 2>/dev/null")
     if nvidia:
-        gpus = []
         for line in nvidia.splitlines():
             parts = [x.strip() for x in line.split(",")]
             if len(parts) >= 5:
                 gpus.append({
-                    "vendor": "NVIDIA", "name": parts[0], "temperature": parts[1],
-                    "vram_used": parts[2], "vram_total": parts[3], "usage": parts[4],
+                    "vendor": "NVIDIA", "name": parts[0],
+                    "temperature": parts[1] + " °C" if parts[1] not in ("N/A","[N/A]","") else "N/A",
+                    "vram_used": parts[2] + " MiB" if parts[2] not in ("N/A","") else "N/A",
+                    "vram_total": parts[3] + " MiB" if parts[3] not in ("N/A","") else "N/A",
+                    "usage": parts[4] + "%" if parts[4] not in ("N/A","") else "N/A",
                 })
+        if gpus:
+            return gpus
+    # ── AMD via rocm-smi ──
+    rocm = run_cmd("rocm-smi --showproductname --showtemp --showuse --showmeminfo vram 2>/dev/null")
+    if rocm and "GPU" in rocm:
+        gpus.append({"vendor": "AMD/ROCm", "name": "AMD GPU", "temperature": "see rocm-smi",
+                     "vram_used": "N/A", "vram_total": "N/A", "usage": "N/A", "raw": rocm[:300]})
         return gpus
-    lspci_gpu = run_cmd("lspci 2>/dev/null | grep -i 'vga\\|3d\\|display'")
-    if lspci_gpu:
-        return [{"vendor": "Detected", "name": l.strip(), "temperature": "N/A",
-                  "vram_used": "N/A", "vram_total": "N/A", "usage": "N/A"} for l in lspci_gpu.splitlines()]
-    return [{"info": "No GPU detected."}]
+    # ── Intel via intel_gpu_top or sysfs ──
+    intel_name = run_cmd("cat /sys/bus/pci/devices/*/vendor 2>/dev/null | grep -l 0x8086 | head -1")
+    intel_drm = run_cmd("ls /sys/class/drm/ 2>/dev/null | grep -E '^card[0-9]+$'")
+    if intel_drm:
+        for card in intel_drm.splitlines()[:4]:
+            name_f = f"/sys/class/drm/{card}/device/product_name"
+            vendor_f = f"/sys/class/drm/{card}/device/uevent"
+            gpu_name = run_cmd(f"cat {name_f} 2>/dev/null") or run_cmd(f"grep -iE 'id_model_from_database|id_model' {vendor_f} 2>/dev/null | head -1 | cut -d= -f2") or card
+            gpus.append({"vendor": "Intel/Other", "name": gpu_name.strip() or card,
+                         "temperature": "N/A", "vram_used": "N/A", "vram_total": "N/A", "usage": "N/A"})
+    # ── lspci fallback ──
+    if not gpus:
+        lspci_gpu = run_cmd("lspci 2>/dev/null | grep -iE 'vga|3d|display|graphics'")
+        if lspci_gpu:
+            for l in lspci_gpu.splitlines():
+                # Extract vendor/name from lspci line: "00:02.0 VGA: Intel UHD Graphics 620"
+                parts = l.split(": ", 1)
+                gpu_name = parts[1].strip() if len(parts) > 1 else l.strip()
+                vendor = "NVIDIA" if "nvidia" in gpu_name.lower() else "AMD" if ("amd" in gpu_name.lower() or "radeon" in gpu_name.lower()) else "Intel" if "intel" in gpu_name.lower() else "GPU"
+                gpus.append({"vendor": vendor, "name": gpu_name,
+                             "temperature": "N/A", "vram_used": "N/A", "vram_total": "N/A", "usage": "N/A"})
+    # ── /proc/driver/nvidia fallback ──
+    if not gpus:
+        proc_nv = run_cmd("cat /proc/driver/nvidia/gpus/*/information 2>/dev/null | head -20")
+        if proc_nv:
+            gpus.append({"vendor": "NVIDIA", "name": proc_nv.split("\n")[0].replace("Model:","").strip(),
+                         "temperature": "N/A", "vram_used": "N/A", "vram_total": "N/A", "usage": "N/A"})
+    return gpus if gpus else [{"info": "No GPU detected. Try running as root or install nvidia-smi/lspci."}]
 
 
 @cached("docker_info", ttl=5)
@@ -792,7 +841,38 @@ def tool_reverse_dns(target):
 def tool_whois(target):
     if not _valid_target(target):
         return "Invalid target."
-    return run_cmd(f"whois {target}", timeout=10) or "whois not installed or no response."
+    # Try system whois first
+    result = run_cmd(f"whois {target} 2>/dev/null", timeout=10)
+    if result:
+        return result
+    # Python socket fallback - query IANA whois then follow referral
+    try:
+        def _raw_whois(host, query, port=43):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(8)
+            s.connect((host, port))
+            s.send((query + "\r\n").encode())
+            resp = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+            s.close()
+            return resp.decode(errors="replace")
+        # First query IANA
+        iana_resp = _raw_whois("whois.iana.org", target)
+        # Look for referral whois server
+        referral = None
+        for line in iana_resp.splitlines():
+            if line.lower().startswith("whois:"):
+                referral = line.split(":", 1)[1].strip()
+                break
+        if referral:
+            return _raw_whois(referral, target)
+        return iana_resp or "No whois data found."
+    except Exception as e:
+        return f"whois lookup failed: {e}"
 
 
 def tool_port_scan(target, ports="20-1024"):
@@ -800,20 +880,40 @@ def tool_port_scan(target, ports="20-1024"):
         return ["Invalid target."]
     if not _re.match(r"^[0-9,\-]+$", ports):
         ports = "20-1024"
-    results = []
+    import concurrent.futures
     try:
         start, end = (ports.split("-") + [ports])[:2]
-        start, end = int(start), int(min(int(end), int(start) + 200))  # cap scan size
-        for port in range(start, end + 1):
-            sock_ = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock_.settimeout(0.2)
-            result = sock_.connect_ex((target, port))
-            if result == 0:
-                results.append({"port": port, "state": "open"})
-            sock_.close()
+        start, end = int(start), int(min(int(end), int(start) + 500))  # cap at 500 ports
+        port_range = range(start, end + 1)
     except Exception as e:
         return [{"error": str(e)}]
-    return results or [{"info": "No open ports found in range."}]
+
+    def check_port(port):
+        try:
+            sock_ = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock_.settimeout(0.5)
+            result = sock_.connect_ex((target, port))
+            sock_.close()
+            if result == 0:
+                try:
+                    service = socket.getservbyport(port)
+                except Exception:
+                    service = "unknown"
+                return {"port": port, "state": "open", "service": service}
+        except Exception:
+            pass
+        return None
+
+    results = []
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=100) as ex:
+            for res in ex.map(check_port, port_range, timeout=30):
+                if res:
+                    results.append(res)
+    except Exception as e:
+        return [{"error": str(e)}]
+    results.sort(key=lambda r: r["port"])
+    return results or [{"info": f"No open ports found in range {start}-{end}."}]
 
 
 def tool_subnet_calc(cidr):
@@ -890,14 +990,62 @@ def _packet_callback(pkt):
         pass
 
 
+def _proc_net_snapshot():
+    """Read /proc/net/tcp+udp for basic connection-level packet simulation when scapy unavailable."""
+    rows = []
+    for fname, proto in [("/proc/net/tcp", "TCP"), ("/proc/net/udp", "UDP"), ("/proc/net/tcp6", "TCP6"), ("/proc/net/udp6", "UDP6")]:
+        try:
+            with open(fname) as f:
+                for line in f.readlines()[1:]:
+                    parts = line.split()
+                    if len(parts) < 4: continue
+                    def _hex_addr(h):
+                        try:
+                            ip_hex, port_hex = h.split(":")
+                            # IPv4
+                            import struct
+                            ip = socket.inet_ntoa(struct.pack("<I", int(ip_hex, 16)))
+                            port = int(port_hex, 16)
+                            return f"{ip}:{port}"
+                        except Exception:
+                            return h
+                    src_a = _hex_addr(parts[1])
+                    dst_a = _hex_addr(parts[2])
+                    rows.append({
+                        "time": datetime.datetime.now().strftime("%H:%M:%S.000"),
+                        "proto": proto, "src": src_a, "dst": dst_a,
+                        "length": 0, "info": f"state={parts[3]}"
+                    })
+        except Exception:
+            pass
+    return rows[:100]
+
+
 def _packet_sniff_loop():
     if not _scapy_available:
+        # Fallback: poll /proc/net every 2s
+        while PACKET_CAPTURE_ACTIVE["on"]:
+            rows = _proc_net_snapshot()
+            now_key = datetime.datetime.now().strftime("%H:%M:%S")
+            with PACKET_LOCK:
+                for r in rows:
+                    # deduplicate by src+dst+proto in same second
+                    key = (r["src"], r["dst"], r["proto"])
+                    existing = {(p["src"], p["dst"], p["proto"]) for p in PACKET_BUFFER}
+                    if key not in existing:
+                        PACKET_BUFFER.append(r)
+                if len(PACKET_BUFFER) > 500:
+                    del PACKET_BUFFER[:len(PACKET_BUFFER)-500]
+            time.sleep(2)
         return
-    try:
-        sniff(prn=_packet_callback, store=False,
-              stop_filter=lambda x: not PACKET_CAPTURE_ACTIVE["on"], timeout=300)
-    except Exception:
-        PACKET_CAPTURE_ACTIVE["on"] = False
+    # Scapy path: run in short bursts so stop_filter is checked often
+    while PACKET_CAPTURE_ACTIVE["on"]:
+        try:
+            sniff(prn=_packet_callback, store=False,
+                  stop_filter=lambda x: not PACKET_CAPTURE_ACTIVE["on"], timeout=5)
+        except Exception:
+            PACKET_CAPTURE_ACTIVE["on"] = False
+            break
 
 
 # ---------------- System power tools ----------------
@@ -1147,12 +1295,12 @@ def api_tool_arp():
 @app.route("/api/packets/start")
 @require_admin
 def api_packets_start():
-    if not _scapy_available:
-        return jsonify({"error": "Scapy not available or insufficient privileges (requires root)."}), 400
     if not PACKET_CAPTURE_ACTIVE["on"]:
         PACKET_CAPTURE_ACTIVE["on"] = True
         threading.Thread(target=_packet_sniff_loop, daemon=True).start()
-    return jsonify({"status": "started"})
+    mode = "scapy" if _scapy_available else "proc_net"
+    return jsonify({"status": "started", "mode": mode,
+                    "note": "" if _scapy_available else "Running in /proc/net fallback mode (no Scapy/root). Shows active connections, not raw packets."})
 
 
 @app.route("/api/packets/stop")
@@ -1177,7 +1325,8 @@ def api_packets():
         data = list(PACKET_BUFFER)
     if proto_filter:
         data = [p for p in data if p["proto"] == proto_filter]
-    return jsonify({"active": PACKET_CAPTURE_ACTIVE["on"], "available": _scapy_available, "packets": data[-200:]})
+    mode = "scapy" if _scapy_available else "proc_net"
+    return jsonify({"active": PACKET_CAPTURE_ACTIVE["on"], "available": True, "scapy": _scapy_available, "mode": mode, "packets": data[-200:]})
 
 
 # ---- Process management endpoints (admin-protected) ----
@@ -1269,8 +1418,14 @@ def api_terminal():
         return jsonify({"error": "Empty command."}), 400
     if any(b in command for b in TERMINAL_BLOCKLIST):
         return jsonify({"error": "Command blocked for safety."}), 403
-    output = run_cmd(command, timeout=15)
-    return jsonify({"output": output or "(no output)"})
+    try:
+        result = sp.run(command, shell=True, capture_output=True, text=True, timeout=15)
+        output = (result.stdout or "") + (result.stderr or "")
+        return jsonify({"output": output if output.strip() else "(command produced no output)", "exit_code": result.returncode})
+    except sp.TimeoutExpired:
+        return jsonify({"output": "Command timed out after 15 seconds.", "exit_code": -1})
+    except Exception as e:
+        return jsonify({"output": f"Error: {e}", "exit_code": -1})
 
 
 # ---- System power controls (admin-protected, require confirm flag) ----
@@ -1468,6 +1623,7 @@ body > .d-flex{flex:1 1 auto;min-height:0;overflow:hidden;}
 .admin-token-bar .badge-status{margin-left:.2rem;}
 .badge-running.pulse{box-shadow:0 0 0 0 rgba(28,138,75,.5);animation:pulseGlow 1.6s infinite;}
 @keyframes pulseGlow{0%{box-shadow:0 0 0 0 rgba(28,138,75,.5);}70%{box-shadow:0 0 0 6px rgba(28,138,75,0);}100%{box-shadow:0 0 0 0 rgba(28,138,75,0);}}
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:.6;}}
 .nav-group-label{
   font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:#9a9a9a;
   font-weight:700;padding:.9rem .8rem .3rem;
@@ -1798,7 +1954,7 @@ code.small-code{font-size:.75rem;background:#f3efe2;padding:.1rem .4rem;border-r
     <!-- PACKET MONITOR -->
     <div class="page-section" id="page-packets">
       <div class="section-title"><i class="bi bi-broadcast-pin"></i>Packet Monitor</div>
-      <div class="card p-2 mb-2" id="packetAvailabilityNotice" style="display:none;background:#fdf3da;color:#a9791f;font-size:.82rem;"></div>
+      <div class="card p-2 mb-2" id="packetAvailabilityNotice" style="background:#fdf3da;color:#a9791f;font-size:.82rem;">⏳ Checking packet capture status...</div>
       <div class="card p-3 mb-3 d-flex flex-row gap-2 align-items-center flex-wrap">
         <button class="btn btn-navy btn-sm" id="packetStartBtn" onclick="packetStart()"><i class="bi bi-play-fill"></i> Start</button>
         <button class="btn btn-outline-secondary btn-sm" onclick="packetStop()"><i class="bi bi-stop-fill"></i> Stop</button>
@@ -1957,21 +2113,37 @@ code.small-code{font-size:.75rem;background:#f3efe2;padding:.1rem .4rem;border-r
 
     <!-- TERMINAL -->
     <div class="page-section" id="page-terminal">
-      <div class="section-title"><i class="bi bi-terminal"></i>Embedded Terminal</div>
-      <div class="card p-2 mb-2">
-        <div class="d-flex gap-2">
-          <input class="form-control" id="adminTokenInput" placeholder="Paste admin token shown in server console...">
-          <button class="btn btn-navy" onclick="document.getElementById('navTokenInput').value=document.getElementById('adminTokenInput').value; submitAdminToken();"><i class="bi bi-check2"></i> Save &amp; Verify</button>
+      <div class="section-title"><i class="bi bi-terminal-fill"></i>Embedded Terminal</div>
+      <div class="card p-3 mb-3" style="border-left:4px solid var(--gold);">
+        <div class="d-flex gap-2 align-items-center flex-wrap">
+          <i class="bi bi-key-fill" style="color:var(--gold);"></i>
+          <input class="form-control" id="adminTokenInput" placeholder="Paste admin token from server console..." style="max-width:360px;">
+          <button class="btn btn-navy btn-sm" onclick="document.getElementById('navTokenInput').value=document.getElementById('adminTokenInput').value; submitAdminToken();"><i class="bi bi-check2-circle"></i> Unlock</button>
+          <span id="terminalTokenStatus" class="badge-status badge-stopped">Locked</span>
         </div>
-        <div class="small text-muted mt-1">Required for terminal, process kill, and power actions. Token is printed in your <strong>server console</strong> on startup. Status: <span id="terminalTokenStatus">check navbar pill</span></div>
+        <div class="small text-muted mt-2"><i class="bi bi-info-circle"></i> Token printed in <strong>server console</strong> on startup. Required for all admin actions.</div>
       </div>
-      <div class="card p-3" style="background:#0B1F3A;color:#e9e6da;border-radius:14px;">
-        <pre id="terminalOutput" style="height:320px;overflow:auto;font-size:.82rem;margin:0;"></pre>
-        <div class="d-flex gap-2 mt-2">
-          <span style="color:#D4AF37;">$</span>
-          <input class="form-control bg-transparent text-white border-0" id="terminalInput" style="outline:none;box-shadow:none;" onkeyup="if(event.key==='Enter') runTerminal()">
+      <div style="background:#0d1117;border-radius:14px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.4);">
+        <div style="background:#161b22;padding:.5rem 1rem;display:flex;align-items:center;gap:.6rem;border-bottom:1px solid #30363d;">
+          <span style="width:12px;height:12px;border-radius:50%;background:#ff5f57;display:inline-block;"></span>
+          <span style="width:12px;height:12px;border-radius:50%;background:#febc2e;display:inline-block;"></span>
+          <span style="width:12px;height:12px;border-radius:50%;background:#28c840;display:inline-block;"></span>
+          <span style="color:#8b949e;font-size:.78rem;margin-left:.5rem;font-family:monospace;">bash — Vigilon Terminal</span>
+          <button class="btn btn-sm ms-auto" style="color:#8b949e;background:none;border:none;font-size:.78rem;" onclick="document.getElementById('terminalOutput').textContent=''"><i class="bi bi-trash"></i> Clear</button>
+        </div>
+        <pre id="terminalOutput" style="height:420px;overflow-y:auto;font-size:.83rem;margin:0;padding:1rem;color:#c9d1d9;font-family:'JetBrains Mono','Fira Code',Consolas,monospace;line-height:1.6;background:#0d1117;"></pre>
+        <div style="display:flex;align-items:center;gap:.5rem;padding:.5rem 1rem;background:#161b22;border-top:1px solid #30363d;">
+          <span style="color:#3fb950;font-family:monospace;font-weight:700;">➜</span>
+          <span style="color:#58a6ff;font-family:monospace;font-size:.83rem;" id="termCwd">~</span>
+          <span style="color:#8b949e;font-family:monospace;">$</span>
+          <input id="terminalInput" autocomplete="off" spellcheck="false"
+            style="flex:1;background:transparent;border:none;outline:none;color:#c9d1d9;font-family:'JetBrains Mono',Consolas,monospace;font-size:.83rem;caret-color:#3fb950;"
+            placeholder="type command and press Enter..."
+            onkeydown="termKeyDown(event)">
+          <button class="btn btn-sm" style="color:#3fb950;background:none;border:1px solid #30363d;border-radius:6px;font-size:.75rem;" onclick="runTerminal()"><i class="bi bi-arrow-return-left"></i></button>
         </div>
       </div>
+      <div class="small text-muted mt-2"><i class="bi bi-exclamation-triangle"></i> Full shell access. Treat token like a root password.</div>
     </div>
 
     <!-- SYSTEM TOOLS -->
@@ -2292,22 +2464,23 @@ async function loadHardware(){
 async function loadWifi(){
   const d = await fetchJSON('/api/wifi');
   if (!d) return;
+  const box = document.getElementById('wifiBox');
   if (!d.available){
-    document.getElementById('wifiBox').innerHTML = `<p class="text-muted">No wireless interface detected.</p>`;
+    box.innerHTML = `<p class="text-muted"><i class="bi bi-wifi-off"></i> ${escapeHtml(d.message || 'No wireless interface detected.')}</p>`;
     return;
   }
   if (d.ssid){
-    document.getElementById('wifiBox').innerHTML = `
-      <table class="modern"><tbody>
-      <tr><td><strong>SSID</strong></td><td>${escapeHtml(d.ssid)}</td></tr>
-      <tr><td><strong>Signal</strong></td><td>${escapeHtml(d.signal)}</td></tr>
-      <tr><td><strong>Frequency</strong></td><td>${escapeHtml(d.frequency)}</td></tr>
-      <tr><td><strong>Channel</strong></td><td>${escapeHtml(d.channel)}</td></tr>
-      <tr><td><strong>Security</strong></td><td>${escapeHtml(d.security)}</td></tr>
-      <tr><td><strong>Bitrate</strong></td><td>${escapeHtml(d.bitrate)}</td></tr>
-      </tbody></table>`;
+    const rows = [
+      ['SSID', d.ssid], ['Signal', d.signal], ['Frequency', d.frequency],
+      ['Channel', d.channel], ['Security', d.security], ['Bitrate', d.bitrate]
+    ].map(([k,v])=>`<tr><td style="width:160px;font-weight:600;">${k}</td><td>${escapeHtml(v)}</td></tr>`).join('');
+    box.innerHTML = `<table class="modern"><tbody>${rows}</tbody></table>`;
+  } else if (d.networks && d.networks.length){
+    box.innerHTML = `<p class="text-muted mb-2"><i class="bi bi-wifi"></i> ${escapeHtml(d.message)}</p>
+      <strong>Available networks:</strong><ul class="mt-1">${d.networks.map(n=>`<li>${escapeHtml(n)}</li>`).join('')}</ul>`;
   } else {
-    document.getElementById('wifiBox').innerHTML = `<p>${escapeHtml(d.message || 'Wireless interface present.')}</p>`;
+    box.innerHTML = `<p class="text-muted"><i class="bi bi-wifi"></i> ${escapeHtml(d.message || 'Wireless interface present.')}</p>
+      ${d.raw ? `<pre style="font-size:.78rem;max-height:200px;overflow:auto;">${escapeHtml(d.raw)}</pre>` : ''}`;
   }
 }
 
@@ -2329,15 +2502,12 @@ function syncTokenFields(v){
 }
 
 function setAdminStatusPill(valid){
-  const pill = document.getElementById('adminStatusPill');
-  if (!pill) return;
-  if (valid){
-    pill.textContent = 'Unlocked';
-    pill.className = 'badge-status badge-running pulse';
-  } else {
-    pill.textContent = 'Locked';
-    pill.className = 'badge-status badge-stopped';
-  }
+  ['adminStatusPill', 'terminalTokenStatus'].forEach(id => {
+    const pill = document.getElementById(id);
+    if (!pill) return;
+    if (valid){ pill.textContent = 'Unlocked'; pill.className = 'badge-status badge-running pulse'; }
+    else { pill.textContent = 'Locked'; pill.className = 'badge-status badge-stopped'; }
+  });
 }
 
 async function submitAdminToken(){
@@ -2409,16 +2579,14 @@ async function packetStart(){
     return;
   }
   const r = await adminFetch('/api/packets/start');
-  if (r.error){
-    showToast(r.error);
-    document.getElementById('packetAvailabilityNotice').style.display = 'block';
-    document.getElementById('packetAvailabilityNotice').textContent =
-      '⚠ ' + r.error + ' Install Scapy (pip install scapy) and run the server as root to enable live packet capture.';
+  if (!r || r.error){
+    showToast((r && r.error) || 'Failed to start capture.');
     return;
   }
-  document.getElementById('packetStatus').textContent = 'capturing';
+  if (r.note) showToast(r.note);
   clearInterval(packetPolling);
   packetPolling = setInterval(loadPackets, 1500);
+  loadPackets();
 }
 async function packetStop(){
   await adminFetch('/api/packets/stop');
@@ -2434,21 +2602,35 @@ async function loadPackets(){
   const d = await fetchJSON('/api/packets?proto=' + encodeURIComponent(proto));
   if (!d) return;
   const notice = document.getElementById('packetAvailabilityNotice');
-  const startBtn = document.getElementById('packetStartBtn');
-  if (!d.available){
-    document.getElementById('packetStatus').textContent = 'unavailable';
+  const statusBadge = document.getElementById('packetStatus');
+  // Update status badge with color
+  if (d.active){
+    statusBadge.textContent = '● Live';
+    statusBadge.className = 'badge small';
+    statusBadge.style.cssText = 'background:#1c8a4b;color:#fff;animation:pulse 1.5s infinite;';
+  } else {
+    statusBadge.textContent = '■ Stopped';
+    statusBadge.className = 'badge small';
+    statusBadge.style.cssText = 'background:#6c757d;color:#fff;';
+  }
+  // Mode notice
+  if (!d.scapy){
     notice.style.display = 'block';
-    notice.textContent = '⚠ Scapy is not installed or this server is not running as root. Packet capture needs raw-socket access. Install with "pip install scapy" and restart with sudo.';
-    startBtn.disabled = true;
+    notice.textContent = 'ℹ Running in /proc/net fallback mode — shows active connections. For raw packet capture, install Scapy (pip install scapy) and run as root.';
   } else {
     notice.style.display = 'none';
-    startBtn.disabled = false;
-    document.getElementById('packetStatus').textContent = d.active ? 'capturing' : 'stopped';
   }
-  document.getElementById('packetsTable').innerHTML = d.packets.length ? d.packets.map(p=>`
-    <tr><td>${escapeHtml(p.time)}</td><td>${escapeHtml(p.proto)}</td><td>${escapeHtml(p.src)}</td>
-    <td>${escapeHtml(p.dst)}</td><td>${escapeHtml(p.length)}</td><td>${escapeHtml(p.info)}</td></tr>`).join('')
-    : '<tr><td colspan="6" class="text-muted">No packets captured yet. Click Start to begin.</td></tr>';
+  const protoColor = {TCP:'#0b5394',UDP:'#7f6000',DNS:'#38761d',ARP:'#741b47',ICMP:'#660000',OTHER:'#444'};
+  document.getElementById('packetsTable').innerHTML = d.packets.length ? [...d.packets].reverse().map(p=>`
+    <tr>
+      <td style="font-family:monospace;font-size:.78rem;">${escapeHtml(p.time)}</td>
+      <td><span style="background:${protoColor[p.proto]||'#444'};color:#fff;padding:.15rem .5rem;border-radius:4px;font-size:.72rem;font-weight:700;">${escapeHtml(p.proto)}</span></td>
+      <td style="font-family:monospace;font-size:.78rem;">${escapeHtml(p.src)}</td>
+      <td style="font-family:monospace;font-size:.78rem;">${escapeHtml(p.dst)}</td>
+      <td>${escapeHtml(String(p.length))}</td>
+      <td class="small text-muted">${escapeHtml(p.info)}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="6" class="text-muted text-center py-3"><i class="bi bi-broadcast-pin"></i> No packets yet — click Start to begin capturing.</td></tr>';
 }
 
 // ---- Bandwidth ----
@@ -2584,19 +2766,43 @@ document.addEventListener('click', e => {
 async function loadFilesystemDefault(){ loadFilesystem(); }
 
 // ---- Terminal ----
+let _termHistory = [], _termHistIdx = -1, _termCwd = '~';
+function termKeyDown(e){
+  if (e.key === 'Enter'){ runTerminal(); return; }
+  if (e.key === 'ArrowUp'){ e.preventDefault(); if (_termHistIdx < _termHistory.length-1){ _termHistIdx++; e.target.value = _termHistory[_termHistIdx]||'';}  return; }
+  if (e.key === 'ArrowDown'){ e.preventDefault(); if (_termHistIdx > 0){ _termHistIdx--; e.target.value = _termHistory[_termHistIdx]||'';} else { _termHistIdx=-1; e.target.value='';}  return; }
+}
 async function runTerminal(){
   const input = document.getElementById('terminalInput');
-  const cmd = input.value;
-  if (!cmd.trim()) return;
+  const cmd = input.value.trim();
+  if (!cmd) return;
   if (!getAdminToken()){
-    showToast('Admin token required. Paste it in the navbar (top right) and click the check button first.');
+    appendTermLine('\x1b[31m✗ Admin token required. Paste it in the Unlock bar above.\x1b[0m', 'err');
     return;
   }
-  const box = document.getElementById('terminalOutput');
-  box.textContent += `\n$ ${cmd}\n`;
+  _termHistory.unshift(cmd); _termHistIdx = -1;
+  // Show prompt + command
+  appendTermLine(`\x1b[32m➜\x1b[0m \x1b[34m${escapeHtml(_termCwd)}\x1b[0m $ \x1b[1m${escapeHtml(cmd)}\x1b[0m`, 'cmd');
   input.value = '';
-  const r = await adminFetch('/api/terminal', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({command: cmd})});
-  box.textContent += (r.output || r.error || '');
+  input.disabled = true;
+  try {
+    const r = await adminFetch('/api/terminal', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({command: cmd})});
+    const out = r ? (r.output || r.error || '(no output)') : 'Request failed.';
+    appendTermLine(escapeHtml(out), r && r.exit_code === 0 ? 'out' : 'err');
+    // track cwd
+    if (cmd.startsWith('cd ')){
+      const cdR = await adminFetch('/api/terminal', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({command: 'pwd'})});
+      if (cdR && cdR.output) { _termCwd = cdR.output.trim(); document.getElementById('termCwd').textContent = _termCwd; }
+    }
+  } catch(e){ appendTermLine('Network error: ' + e.message, 'err'); }
+  input.disabled = false; input.focus();
+}
+function appendTermLine(text, type){
+  const box = document.getElementById('terminalOutput');
+  const line = document.createElement('div');
+  line.style.cssText = type==='err' ? 'color:#f85149;' : type==='cmd' ? 'color:#c9d1d9;margin-top:.3rem;' : 'color:#c9d1d9;';
+  line.textContent = text;
+  box.appendChild(line);
   box.scrollTop = box.scrollHeight;
 }
 
