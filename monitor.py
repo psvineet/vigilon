@@ -18,12 +18,23 @@ def _ensure(pkg_import: str, pip_name: str = None):
     pip_name = pip_name or pkg_import
     try:
         importlib.import_module(pkg_import)
+        return  # already installed
     except ImportError:
-        print(f"  -> Installing missing dependency: {pip_name} ...")
+        pass
+    print(f"  -> Installing missing dependency: {pip_name} ...")
+    # Try with --break-system-packages first (needed on modern Debian/Ubuntu/macOS)
+    for extra_flags in [["--break-system-packages"], ["--user"], []]:
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pip_name])
-        except Exception as e:
-            print(f"  !! Could not install {pip_name}: {e}")
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", pip_name] + extra_flags,
+                stderr=subprocess.DEVNULL,
+            )
+            # Verify it's now importable
+            importlib.import_module(pkg_import)
+            return
+        except Exception:
+            continue
+    print(f"  !! Could not install {pip_name}. Run manually: pip install {pip_name}")
 
 print("=" * 50)
 print("Vigilon - System Monitor")
@@ -186,7 +197,10 @@ def get_system_info():
         "architecture": uname.machine,
         "python_version": platform.python_version(),
         "machine": uname.machine,
-        "processor": uname.processor or platform.processor() or "Unknown",
+        "processor": (
+            run_cmd("lscpu 2>/dev/null | grep -m1 'Model name' | sed 's/.*: *//'")
+            or uname.processor or platform.processor() or "Unknown"
+        ).strip(),
         "boot_time": datetime.datetime.fromtimestamp(boot_ts).strftime("%Y-%m-%d %H:%M:%S"),
         "uptime": uptime_str(time.time() - boot_ts),
         "timezone": safe(lambda: str(datetime.datetime.now().astimezone().tzinfo), "Unknown"),
@@ -478,21 +492,30 @@ def get_wifi_info():
     iw_out = run_cmd("iwconfig 2>/dev/null") or run_cmd("nmcli -t -f active,ssid,signal,freq,chan,security,rate dev wifi 2>/dev/null")
     if not iw_out:
         return {"available": False, "message": "No wireless interface detected."}
-    nmcli_out = run_cmd("nmcli -t -f active,ssid,signal,freq,chan,security,rate dev wifi 2>/dev/null")
+    # Use pipe separator to avoid breaking on SSIDs with colons
+    nmcli_out = run_cmd("nmcli --terse --fields active,ssid,signal,freq,chan,security,rate dev wifi 2>/dev/null")
     if nmcli_out:
         for line in nmcli_out.splitlines():
-            parts = line.split(":")
-            if len(parts) >= 7 and parts[0] == "yes":
+            # nmcli --terse uses colon but escapes embedded colons as \:
+            # Split on unescaped colons only
+            import re as _re2
+            parts = _re2.split(r'(?<!\\):', line)
+            parts = [p.replace('\\:', ':') for p in parts]
+            if len(parts) >= 7 and parts[0].lower() in ('yes', 'true', '*'):
                 return {
                     "available": True,
-                    "ssid": parts[1],
+                    "ssid": parts[1] or "(hidden)",
                     "signal": parts[2] + "%",
                     "frequency": parts[3],
                     "channel": parts[4],
-                    "security": parts[5],
+                    "security": parts[5] or "Open",
                     "bitrate": parts[6],
                 }
-    return {"available": True, "message": "Wireless interface present; details limited.", "raw": iw_out[:500]}
+    # fallback: try iw
+    iw_ssid = run_cmd("iw dev 2>/dev/null | awk '/Interface/{iface=$2} /ssid/{print iface\":\"+$2}'") or ""
+    if iw_ssid:
+        return {"available": True, "message": "Connected", "raw": iw_out[:800]}
+    return {"available": True, "message": "Wireless interface present; nmcli/iw details unavailable.", "raw": iw_out[:500]}
 
 
 @cached("hardware_info", ttl=10)
@@ -1397,14 +1420,14 @@ body{
   flex-direction:column;
   min-height:100vh;
 }
-body > .d-flex{flex:1 0 auto;}
+body > .d-flex{flex:1 1 auto;min-height:0;overflow:hidden;}
 .navbar{
   background:var(--navy);
   position:sticky;
   top:0;
   z-index:1000;
   box-shadow:0 2px 12px rgba(0,0,0,.15);
-  padding:.75rem 1.25rem;
+  padding:.4rem 1.25rem;
 }
 .navbar .brand{
   color:var(--white);
@@ -1423,12 +1446,14 @@ body > .d-flex{flex:1 0 auto;}
 #globalSearch::placeholder{color:rgba(255,255,255,.6);}
 .sidebar{
   position:sticky;
-  top:64px;
-  height:calc(100vh - 64px);
+  top:52px;
+  height:calc(100vh - 52px);
   overflow-y:auto;
+  overflow-x:hidden;
   background:var(--white);
   border-right:1px solid var(--border);
   padding:1rem .6rem;
+  flex-shrink:0;
   transition:transform .25s ease;
 }
 .admin-token-bar{
@@ -1465,7 +1490,7 @@ body > .d-flex{flex:1 0 auto;}
   color:var(--white);
 }
 .sidebar .nav-link.active i{color:var(--gold);}
-.main-content{padding:1.5rem;}
+.main-content{padding:1.5rem;overflow-y:auto;min-width:0;}
 .card{
   border:1px solid var(--border);
   border-radius:16px;
@@ -1525,12 +1550,12 @@ footer a.gold:hover{text-decoration:underline;}
 .search-bar{border-radius:10px;border:1px solid var(--border);}
 @media (max-width:991px){
   .sidebar{
-    position:fixed;left:0;top:64px;width:260px;transform:translateX(-100%);
+    position:fixed;left:0;top:52px;width:260px;transform:translateX(-100%);
     z-index:1050;background:#fff;box-shadow:4px 0 18px rgba(0,0,0,.15);
   }
   .sidebar.show{transform:translateX(0);}
   .sidebar-backdrop{
-    position:fixed;inset:64px 0 0 0;background:rgba(0,0,0,.35);z-index:1040;display:none;
+    position:fixed;inset:52px 0 0 0;background:rgba(0,0,0,.35);z-index:1040;display:none;
   }
   .sidebar-backdrop.show{display:block;}
   #globalSearch{max-width:140px;}
@@ -1938,7 +1963,7 @@ code.small-code{font-size:.75rem;background:#f3efe2;padding:.1rem .4rem;border-r
           <input class="form-control" id="adminTokenInput" placeholder="Paste admin token shown in server console...">
           <button class="btn btn-navy" onclick="document.getElementById('navTokenInput').value=document.getElementById('adminTokenInput').value; submitAdminToken();"><i class="bi bi-check2"></i> Save &amp; Verify</button>
         </div>
-        <div class="small text-muted mt-1">Required for terminal, process kill, and power actions. Printed once at server startup. Status: <span id="terminalTokenStatus">check navbar pill</span></div>
+        <div class="small text-muted mt-1">Required for terminal, process kill, and power actions. Token is printed in your <strong>server console</strong> on startup. Status: <span id="terminalTokenStatus">check navbar pill</span></div>
       </div>
       <div class="card p-3" style="background:#0B1F3A;color:#e9e6da;border-radius:14px;">
         <pre id="terminalOutput" style="height:320px;overflow:auto;font-size:.82rem;margin:0;"></pre>
@@ -2005,7 +2030,7 @@ code.small-code{font-size:.75rem;background:#f3efe2;padding:.1rem .4rem;border-r
   </div>
 </div>
 
-<footer>Built by <a href="https://admin.xo.je" target="_blank" rel="noopener" class="gold">Vineet Pratap Singh</a></footer>
+<footer>Built by <a href="https://admin.xo.je" target="_blank" rel="noopener" class="gold">Vineet Pratap Singh</a> &copy; <span id="year"></span></footer>
 
 <div class="toast-container position-fixed bottom-0 end-0 p-3">
   <div id="liveToast" class="toast align-items-center text-bg-dark" role="alert">
@@ -2018,7 +2043,8 @@ code.small-code{font-size:.75rem;background:#f3efe2;padding:.1rem .4rem;border-r
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-document.getElementById('year').textContent = new Date().getFullYear();
+const _yearEl = document.getElementById('year');
+if (_yearEl) _yearEl.textContent = new Date().getFullYear();
 let REFRESH_MS = 2000;
 let refreshTimer = null;
 
@@ -2292,7 +2318,7 @@ function showToast(msg){
 }
 
 function getAdminToken(){
-  return localStorage.getItem('admin_token') || '';
+  try { return localStorage.getItem('admin_token') || sessionStorage.getItem('admin_token') || ''; } catch(e){ return sessionStorage.getItem('admin_token') || ''; }
 }
 
 function syncTokenFields(v){
@@ -2322,7 +2348,7 @@ async function submitAdminToken(){
     showToast('Enter the admin token printed in the server console first.');
     return;
   }
-  localStorage.setItem('admin_token', v);
+  try { localStorage.setItem('admin_token', v); } catch(e){} try { sessionStorage.setItem('admin_token', v); } catch(e){}
   syncTokenFields(v);
   try{
     const r = await fetch('/api/admin-token-check', {headers:{'X-Admin-Token': v}});
