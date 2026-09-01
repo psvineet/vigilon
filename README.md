@@ -1,6 +1,6 @@
 # Vigilon - System Monitor Dashboard
 
-A premium, enterprise-grade, **single-file** Linux system monitoring dashboard built with Flask and psutil. No build step, no frontend framework, no database server to set up — just one `monitor.py` file that runs a full real-time monitoring web app.
+A premium, enterprise-grade, **single-file** Linux system monitoring dashboard built with Flask and psutil. No build step, no frontend framework, no database server to set up — just one `monitor.py` file that runs a full real-time monitoring web app. [Preview](https://github.com/psvineet/vigilon/raw/refs/heads/main/Screencast_20260901_132614.webm)
 
 ![Theme](https://img.shields.io/badge/theme-Navy%20%26%20Gold-0B1F3A) ![Python](https://img.shields.io/badge/python-3.9%2B-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
